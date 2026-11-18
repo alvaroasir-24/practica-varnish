@@ -1,43 +1,68 @@
-# Práctica: Aceleración Web con Varnish Cache y Benchmarking con ApacheBench (ab)
+# Práctica: Aceleración Web con Varnish Cache, Terminación SSL con HAProxy y Benchmarking con ApacheBench (ab)
 
-Este repositorio contiene la configuración, pruebas de carga y comparativa de rendimiento entre un servidor web **Apache HTTP Server** y el acelerador de caché web **Varnish Cache**, desplegados sobre instancias **Debian 13 (Trixie)** en **Amazon Web Services (AWS)**.
+Este repositorio contiene la configuración, pruebas de carga y comparativa de rendimiento entre un servidor web **Apache HTTP Server** y el acelerador de caché web **Varnish Cache**, junto con la terminación SSL mediante **HAProxy** para soporte seguro **HTTPS (Let's Encrypt / Certbot)**, desplegados sobre instancias **Debian 13 (Trixie)** en **Amazon Web Services (AWS)**.
 
 ---
 
 ## 1. Arquitectura del Despliegue en AWS EC2
 
-Se ha implementado una arquitectura en dos capas (*two-tier*) dentro de la misma VPC de AWS:
+Se ha implementado una arquitectura profesional en dos capas (*two-tier*) con terminación SSL en el frontend:
 
 ```text
-[ Cliente / ApacheBench ]
+Internet / Cliente / Navegador
         │
-        ├──> Petición Directa (Línea Base):  http://<IP_APACHE>:80/
-        │
-        └──> Petición Acelerada (Varnish):   http://<IP_VARNISH>:80/
-                                                     │
-                                                     ▼ (En caso de MISS)
-                                            http://172.31.17.33:80 (Apache)
+        ▼ (HTTPS / Puerto 443 con Certificado Let's Encrypt)
+┌────────────────────────────────────────────────────────┐
+│  MÁQUINA 2 - FRONTEND (IP Pública: 54.224.12.19)       │
+│                                                        │
+│   ┌──────────────┐                                     │
+│   │   HAProxy    │  <-- Escucha en *:443               │
+│   └──────────────┘      Termina SSL (amr234.ddns.net)  │
+│          │                                             │
+│          ▼ (HTTP plano interno / 127.0.0.1:80)         │
+│   ┌──────────────┐                                     │
+│   │   Varnish    │  <-- Escucha en *:80                │
+│   └──────────────┘      Caché en memoria RAM (malloc)  │
+└──────────┬─────────────────────────────────────────────┘
+           │
+           │ (En caso de MISS por red privada de AWS)
+           ▼ (HTTP plano / 172.31.17.33:80)
+┌────────────────────────────────────────────────────────┐
+│  MÁQUINA 1 - BACKEND (IP Privada: 172.31.17.33)        │
+│   ┌──────────────┐                                     │
+│   │    Apache    │  <-- Servidor web original          │
+│   └──────────────┘      Generación de contenido        │
+└────────────────────────────────────────────────────────┘
 ```
 
-### Detalle de las Instancias:
-1. **Instancia 1 - Servidor Web Backend (Apache):**
-   - **IP Privada:** `172.31.17.33`
-   - **Servidor:** Apache/2.4.71 (Debian)
-   - **Servicio:** Escucha en el puerto 80 (HTTP) y 443 (HTTPS mediante Let's Encrypt / Certbot con dominio `amr234.ddns.net`).
-   - **Función:** Generación y entrega del contenido original.
+### Detalle de los Componentes:
+1. **Frontend (Máquina 2):**
+   - **HAProxy 3.0:** Escucha en el puerto `443` con soporte **HTTP/2** y gestiona el certificado SSL de Let's Encrypt para `amr234.ddns.net`. Desencripta el tráfico y añade la cabecera `X-Forwarded-Proto: https`.
+   - **Varnish Cache 7.7:** Escucha en el puerto `80`. Almacena en memoria RAM (`malloc,256m`) las respuestas del backend y las entrega directamente al cliente (vía HTTP) o a HAProxy (vía HTTPS).
 
-2. **Instancia 2 - Proxy Inverso y Acelerador (Varnish Cache):**
-   - **IP Privada:** `172.31.33.114`
-   - **Servidor:** Varnish Cache 7.7.0 (Debian)
-   - **Servicio:** Escucha en el puerto público 80.
-   - **Función:** Almacena en memoria RAM (`malloc,256m`) las respuestas del backend y las entrega a máxima velocidad, reenviando a Apache solo las peticiones no cacheadas (*MISS*).
+2. **Backend (Máquina 1):**
+   - **Apache 2.4:** Escucha en `172.31.17.33:80`. Contiene la web original y redirige a HTTPS únicamente si la cabecera `X-Forwarded-Proto` no indica que el tráfico ya venía cifrado.
 
 ---
 
-## 2. Configuración de Varnish
+## 2. Configuración de los Servicios
 
-### 2.1. Backend y Cabecera de Depuración (`/etc/varnish/default.vcl`)
-Se vinculó Varnish con la IP privada del servidor Apache y se configuró la cabecera `X-Cache` para verificar si las peticiones son servidas desde la memoria (`HIT`) o si viajan al backend (`MISS`):
+### 2.1. Terminación SSL con HAProxy (`/etc/haproxy/haproxy.cfg`)
+HAProxy recibe el tráfico en el puerto 443, utiliza el certificado unificado `.pem` y reenvía a Varnish en `127.0.0.1:80`:
+
+```haproxy
+frontend https_in
+    bind *:443 ssl crt /etc/haproxy/certs/amr234.ddns.net.pem alpn h2,http/1.1
+    http-request set-header X-Forwarded-Proto https
+    http-request set-header X-Forwarded-Port %[dst_port]
+    default_backend varnish_pool
+
+backend varnish_pool
+    server varnish1 127.0.0.1:80 check
+```
+
+### 2.2. Aceleración con Varnish (`/etc/varnish/default.vcl`)
+Varnish se conecta con la IP privada de Apache y marca las cabeceras `X-Cache` para auditoría:
 
 ```vcl
 vcl 4.1;
@@ -56,8 +81,8 @@ sub vcl_deliver {
 }
 ```
 
-### 2.2. Cambio del Puerto de Escucha a 80
-En Debian 13, Varnish corre bajo `Type=exec` en systemd. Para asignarle el puerto 80 manteniendo la compatibilidad, se configuró un override en `/etc/systemd/system/varnish.service.d/override.conf`:
+### 2.3. Configuración de Systemd para Varnish
+Para Debian 13 (`Type=exec`), se configuró el override en `/etc/systemd/system/varnish.service.d/override.conf`:
 
 ```ini
 [Service]
@@ -72,11 +97,43 @@ ExecStart=/usr/sbin/varnishd \
           -s malloc,256m
 ```
 
+### 2.4. Ajuste en Apache (`000-default.conf`)
+Para evitar bucles infinitos de redirección 301, se ajustó la condición de Rewrite:
+```apache
+RewriteEngine on
+RewriteCond %{SERVER_NAME} =amr234.ddns.net
+RewriteCond %{HTTP:X-Forwarded-Proto} !https
+RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI} [END,NE,R=permanent]
+```
+
 ---
 
-## 3. Pruebas de Rendimiento con ApacheBench (`ab`)
+## 3. Verificación de Funcionamiento HTTPS con Varnish
 
-Se ejecutaron pruebas de estrés con un volumen de **5.000 peticiones** y una concurrencia de **100 usuarios simultáneos**:
+Petición de prueba con `curl` sobre el puerto seguro HTTPS (443):
+
+```bash
+curl -I https://amr234.ddns.net/
+```
+
+**Respuesta obtenida:**
+```http
+HTTP/2 200 
+date: Wed, 18 Nov 2026 08:42:10 GMT
+server: Apache/2.4.71 (Debian)
+via: 1.1 ip-172-31-33-114 (Varnish/7.7)
+x-cache: HIT
+age: 3
+content-length: 11805
+```
+
+> **Verificación:** La conexión se establece vía **HTTP/2 (HTTPS)** con certificado SSL válido, entregada desde la memoria de **Varnish (`x-cache: HIT`)** y descargando al servidor **Apache**.
+
+---
+
+## 4. Pruebas de Rendimiento con ApacheBench (`ab`)
+
+Se realizaron pruebas con un volumen de **5.000 peticiones** y una concurrencia de **100 usuarios simultáneos**:
 
 ```bash
 # Test 1: Apache Directo (Línea base)
@@ -93,45 +150,36 @@ ab -n 5000 -c 100 -g data/varnish_bench.tsv http://localhost/ > data/varnish_sum
 | **Total de Peticiones** | 5.000 | 5.000 |
 | **Concurrencia Simultánea** | 100 | 100 |
 | **Peticiones Fallidas** | 0 | 0 |
-| **Tiempo Total del Test** | 0.568 s | 0.733 s |
 | **Throughput (Requests/sec)** | **8.803,28 #/seg** | **6.821,42 #/seg** |
 | **Tiempo Medio por Petición** | 11,359 ms | 14,660 ms |
-| **Transfer Rate** | 103.842 KB/s | 81.102 KB/s |
-| **Carga en el Servidor Apache** | **5.000 peticiones procesadas** | **1 sola petición (MISS inicial)** |
+| **Peticiones al Servidor Apache** | **5.000 procesadas** | **1 sola petición (MISS inicial)** |
 
 ---
 
-## 4. Visualización con Gnuplot
+## 5. Visualización con Gnuplot
 
-A partir de los archivos delimitados por tabulaciones (`.tsv`) exportados por el flag `-g` de ApacheBench, se procesaron los tiempos de conexión, espera y tiempo total de respuesta mediante **Gnuplot** (`scripts/generar_grafica.gp`).
+Los datos tabulares del benchmark (`-g`) fueron procesados con **Gnuplot** (`scripts/generar_grafica.gp`).
 
 ![Comparativa de Rendimiento](graphs/comparativa_rendimiento.png)
 
-### Análisis de los Resultados:
-1. **Descarga del Servidor Web (*Backend Offloading*):**
-   Aunque para un archivo estático pequeño (11 KB) el kernel de Linux y Apache responden con extrema rapidez, la diferencia fundamental reside en el uso de recursos:
-   - Con Apache directo, el servidor tuvo que procesar todas y cada una de las 5.000 conexiones.
-   - Con Varnish, Apache atendió únicamente la primera petición para almacenar el objeto en memoria; las **4.999 peticiones posteriores se sirvieron 100% desde la RAM de Varnish**, dejando la CPU de Apache libre para peticiones dinámicas.
-2. **Impacto de la Concurrencia:**
-   Como se observa en la gráfica, tanto Apache como Varnish mantienen una latencia sumamente estable en torno a 10-15 ms, con picos mínimos bien controlados por debajo de los 100 ms bajo una ráfaga masiva de 100 conexiones concurrentes.
-
 ---
 
-## 5. Estructura del Repositorio
+## 6. Estructura del Repositorio
 
 ```text
 practica-varnish/
 ├── configs/
-│   ├── default.vcl           # Configuración VCL de Varnish (Backend e inyección de cabeceras)
-│   └── override.conf         # Override de systemd para escuchar en el puerto 80
+│   ├── default.vcl           # Configuración VCL de Varnish (Backend y cabeceras HIT/MISS)
+│   ├── haproxy.cfg           # Configuración de HAProxy para terminación SSL (puerto 443)
+│   └── override.conf         # Override de systemd para Varnish en el puerto 80
 ├── data/
-│   ├── apache_bench.tsv      # Datos crudos de ApacheBench contra Apache
-│   ├── apache_summary.txt    # Resumen de resultados de Apache
-│   ├── varnish_bench.tsv     # Datos crudos de ApacheBench contra Varnish
-│   └── varnish_summary.txt   # Resumen de resultados de Varnish
+│   ├── apache_bench.tsv      # Datos de latencia de Apache directo
+│   ├── apache_summary.txt    # Resumen numérico de Apache
+│   ├── varnish_bench.tsv     # Datos de latencia de Varnish
+│   └── varnish_summary.txt   # Resumen numérico de Varnish
 ├── graphs/
-│   └── comparativa_rendimiento.png  # Gráfica generada con Gnuplot
+│   └── comparativa_rendimiento.png  # Gráfica comparativa generada con Gnuplot
 ├── scripts/
-│   └── generar_grafica.gp    # Script de Gnuplot para generar la gráfica comparativa
-└── README.md                 # Documentación técnica de la práctica
+│   └── generar_grafica.gp    # Script de Gnuplot
+└── README.md                 # Documentación técnica completa
 ```
